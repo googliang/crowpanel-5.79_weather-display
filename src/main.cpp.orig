@@ -1,13 +1,8 @@
 /**
  * A weather forecast display system
- * using the Elecrow CrowPanel ESP32 E-Paper HMI 5.79-inch Display.
- *
- * Two display modes (toggled by pressing the side button):
- *   - HOURLY : current conditions + 4 forecasts at +3 h, +6 h, +9 h, +12 h
- *              (wakes at the top of each hour)
- *   - DAILY  : 5-day forecast (today + 4 following days)
- *              (wakes every INTERVAL_IN_MINUTES minutes)
- *
+ * using the Elecrow CrowPanel ESP32 E-Paper HMI 5.79-inch Display,
+ * showing every 3 hours forecast for the next 12 hours.
+ * 
  * The weather forecast data is obtained using the OpenWeatherMap API.
  */
 
@@ -20,28 +15,6 @@
 #include "config.h"
 #include "../test/testdata.h" // data for offline test
 #include <map>
-
-//=============================================================================
-// RTC-retained State  (survives deep sleep)
-//=============================================================================
-
-/**
- * Display mode enumeration
- * Stored in RTC RAM so it persists across deep-sleep cycles.
- */
-enum DisplayMode : uint8_t {
-  MODE_HOURLY = 0,  // Current + 3-hour-step hourly forecast
-  MODE_DAILY  = 1   // 5-day daily forecast
-};
-
-RTC_DATA_ATTR DisplayMode currentMode = MODE_HOURLY;  ///< Active display mode
-
-//=============================================================================
-// Hardware Configuration
-//=============================================================================
-
-/** GPIO pin connected to the side button (active-low, use INPUT_PULLUP). */
-const int SIDE_BUTTON_PIN = 2;  // Adjust to the actual GPIO on your board
 
 //=============================================================================
 // Constants
@@ -76,14 +49,13 @@ enum WeatherIconNumber {
 
 /**
  * Forecast information structure
- * Stores weather forecast data for a specific time period.
- * The `label` field holds "HH:MM" in hourly mode and a weekday name in daily mode.
+ * Stores weather forecast data for a specific time period
  */
 struct ForecastInfo {
-  String label;       // Time (HH:MM) in hourly mode, weekday name in daily mode
-  int iconNumber;     // Weather icon number
-  float temperature;  // Temperature (C or F depending on TEMPERATURE_UNIT)
-  float pop;          // Probability of precipitation (%)
+  String time;       // Time (HH:MM)
+  int iconNumber;    // Weather icon number
+  float temperature; // Temperature (C or F depending on TEMPERATURE_UNIT)
+  float pop;         // Probability of precipitation (%)
 };
 
 //=============================================================================
@@ -127,7 +99,7 @@ String jsonBuffer;
 int httpResponseCode = 0;
 
 // Array to Store Forecast Data
-ForecastInfo forecasts[FORECAST_COUNT];
+ForecastInfo hourlyForecasts[FORECAST_COUNT];
 
 
 //=============================================================================
@@ -135,57 +107,24 @@ ForecastInfo forecasts[FORECAST_COUNT];
 //=============================================================================
 
 /**
- * Returns the number of microseconds until the top of the next full hour.
- * Used in hourly mode so the display refreshes right at the hour mark.
- */
-uint64_t microsecondsUntilNextHour() {
-  time_t now = time(nullptr);
-  struct tm *t = localtime(&now);
-  int secsElapsed = t->tm_min * 60 + t->tm_sec;
-  int secsUntilHour = 3600 - secsElapsed;
-  if (secsUntilHour <= 0) secsUntilHour = 3600; // safety guard
-  return (uint64_t)secsUntilHour * 1000000ULL;
-}
-
-/**
  * Function to Enter Deep-Sleep Mode
- *
- * Always enables EXT0 wakeup on SIDE_BUTTON_PIN (active-low) so the user
- * can switch display modes by pressing the side button at any time.
- *
- * In hourly mode the timer wakes the board at the top of the next hour.
- * In daily mode the timer uses the configured INTERVAL_IN_MINUTES.
- *
- * @param wakeup true if a timer wakeup should also be scheduled
+ * 
+ * @param wakeup true if it needs to wake up later
  */
 void enterDeepSleep(bool wakeup) {
-  Serial.println("Entering Deep-sleep mode.");
+  Serial.println("Entering Deep-sleep mode. Will wake up later.");
   Serial.flush();
-
+  
   // Put EPD in Sleep Mode Before Entering Deep-Sleep Mode
   EPD_DeepSleep();
 
   delay(4000);
-
-  // Always enable wakeup on the side button (falling edge = button press)
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)SIDE_BUTTON_PIN, 0);
-
+  
+  // Enter Deep-Sleep Mode
   if (wakeup) {
-    uint64_t sleepUs;
-    if (currentMode == MODE_HOURLY) {
-      sleepUs = microsecondsUntilNextHour();
-      Serial.print("Hourly mode: sleeping for ");
-      Serial.print((unsigned long)(sleepUs / 1000000ULL));
-      Serial.println(" seconds until next hour.");
-    } else {
-      sleepUs = INTERVAL_IN_MINUTES * 60UL * 1000UL * 1000ULL;
-      Serial.print("Daily mode: sleeping for ");
-      Serial.print(INTERVAL_IN_MINUTES);
-      Serial.println(" minutes.");
-    }
-    esp_sleep_enable_timer_wakeup(sleepUs);
+    // Wake Up After n minutes (default: 60 minites)
+    esp_sleep_enable_timer_wakeup(INTERVAL_IN_MINUTES * 60UL * 1000UL * 1000); // microseconds
   }
-
   esp_deep_sleep_start();
 }
 
@@ -194,14 +133,10 @@ void enterDeepSleep(bool wakeup) {
 //=============================================================================
 
 /**
- * Displays weather forecast on the E-Paper display.
- *
- * In hourly mode the top row shows "HH:MM"; in daily mode it shows the
- * weekday name (e.g. "Mon").  A small mode label is drawn in the first
- * column so the user can see which view is active.
- *
- * Renders icon, temperature and probability of precipitation for each
- * forecast period in a column layout.
+ * Displays weather forecast on the E-Paper display
+ * 
+ * Renders time, weather icon, temperature and probability of precipitation
+ * for each forecast period in a column layout
  */
 void displayWeatherForecast()
 {
@@ -219,33 +154,33 @@ void displayWeatherForecast()
 
   // Display Each Forecast Data
   for (int i = 0; i < FORECAST_COUNT; i++) {
-    if (forecasts[i].label.length() > 0) {
+    if (hourlyForecasts[i].time.length() > 0) {
       // Calculate x position for this column
       int baseX = columnWidth * i;
-
-      // Display label (time or day name)
+      
+      // Display Time
       memset(buffer, 0, sizeof(buffer));
-      snprintf(buffer, sizeof(buffer), "%s", forecasts[i].label.c_str());
+      snprintf(buffer, sizeof(buffer), "%s ", hourlyForecasts[i].time);
       EPD_ShowString(26 + baseX, 18, buffer, 44, BLACK);
 
       // Display Weather Icon
-      EPD_ShowPicture(16 + baseX, 60, 128, 128, Weather_Num[forecasts[i].iconNumber], WHITE);
+      EPD_ShowPicture(16 + baseX, 60, 128, 128, Weather_Num[hourlyForecasts[i].iconNumber], WHITE);
 
       // Display Temperature with appropriate unit
       memset(buffer, 0, sizeof(buffer));
       if (TEMPERATURE_UNIT == 0) {
-        snprintf(buffer, sizeof(buffer), "%3d C", (int)round(forecasts[i].temperature));
+        snprintf(buffer, sizeof(buffer), "%3d C", (int)round(hourlyForecasts[i].temperature));
       } else {
-        snprintf(buffer, sizeof(buffer), "%3d F", (int)round(forecasts[i].temperature));
+        snprintf(buffer, sizeof(buffer), "%3d F", (int)round(hourlyForecasts[i].temperature));
       }
       EPD_ShowString(30 + baseX, 190, buffer, 36, BLACK);
       EPD_DrawCircle(100 + baseX, 201, 2, BLACK, false);
       EPD_DrawCircle(100 + baseX, 201, 3, BLACK, false);
 
-      if (i != -1) {
+      if (i != 0) {
         // Display Probability of precipitation
         memset(buffer, 0, sizeof(buffer));
-        snprintf(buffer, sizeof(buffer), "%3d %%", (int)round(100 * forecasts[i].pop));
+        snprintf(buffer, sizeof(buffer), "%3d %%", (int)round(100 * hourlyForecasts[i].pop));
         EPD_ShowString(30 + baseX, 225, buffer, 36, BLACK);
       }
     }
@@ -259,9 +194,8 @@ void displayWeatherForecast()
   // Update Display
   EPD_Display(ImageBW);
   EPD_PartUpdate();
-
-  Serial.print("Weather forecast displayed successfully (mode: ");
-  Serial.println(currentMode == MODE_HOURLY ? "HOURLY)" : "DAILY)");
+  
+  Serial.println("Weather forecast displayed successfully");
 }
 
 /**
@@ -436,16 +370,15 @@ int getWeatherIconNum(String OpenWeatherMapIcon) {
 }
 
 /**
- * Stores hourly weather information in the forecast array.
- * The label is formatted as "HH:MM" local time.
- *
- * @param index      Index in the forecast array
- * @param unixTime   Unix timestamp (UTC)
- * @param iconCode   OpenWeatherMap icon code
+ * Stores weather information in the forecast array
+ * 
+ * @param index Index in the forecast array
+ * @param unixTime Unix timestamp (UTC)
+ * @param iconCode OpenWeatherMap icon code
  * @param temperature Temperature
- * @param pop        Probability of precipitation
+ * @param pop Probability of precipitation
  */
-void storeHourlyInfo(int index, long unixTime, String iconCode, float temperature, float pop) {
+void storeWeatherInfo(int index, long unixTime, String iconCode, float temperature, float pop) {
   if (index < 0 || index >= FORECAST_COUNT) {
     displayErrorMessage("Invalid forecast index");
     enterDeepSleep(true);
@@ -456,42 +389,13 @@ void storeHourlyInfo(int index, long unixTime, String iconCode, float temperatur
   time_t localTime = unixTime + TIMEZONE_OFFSET * 3600;
   struct tm *timeinfo = localtime(&localTime);
 
-  char tempLabel[6];
-  strftime(tempLabel, sizeof(tempLabel), "%k:%M", timeinfo);
-  forecasts[index].label       = String(tempLabel);
-  forecasts[index].iconNumber  = getWeatherIconNum(iconCode);
-  forecasts[index].temperature = temperature;
-  forecasts[index].pop         = pop;
-}
-
-/**
- * Stores daily weather information in the forecast array.
- * The label is a three-letter weekday abbreviation (e.g. "Mon").
- * Temperature is taken from the daily midday (feels_like.day or temp.day).
- *
- * @param index      Index in the forecast array
- * @param unixTime   Unix timestamp (UTC) of the day
- * @param iconCode   OpenWeatherMap icon code
- * @param temperature Daytime temperature
- * @param pop        Probability of precipitation
- */
-void storeDailyInfo(int index, long unixTime, String iconCode, float temperature, float pop) {
-  if (index < 0 || index >= FORECAST_COUNT) {
-    displayErrorMessage("Invalid forecast index");
-    enterDeepSleep(true);
-    return;
-  }
-
-  // Convert UTC Unix Timestamp to Local Time
-  time_t localTime = unixTime + TIMEZONE_OFFSET * 3600;
-  struct tm *timeinfo = localtime(&localTime);
-
-  char tempLabel[5]; // "Mon\0"
-  strftime(tempLabel, sizeof(tempLabel), " %a", timeinfo);
-  forecasts[index].label       = String(tempLabel);
-  forecasts[index].iconNumber  = getWeatherIconNum(iconCode);
-  forecasts[index].temperature = temperature;
-  forecasts[index].pop         = pop;
+  // Store Information in Structure
+  char tempTimeStr[6];
+  strftime(tempTimeStr, sizeof(tempTimeStr), "%k:%M", timeinfo);
+  hourlyForecasts[index].time = String(tempTimeStr);
+  hourlyForecasts[index].iconNumber = getWeatherIconNum(iconCode);
+  hourlyForecasts[index].temperature = temperature;
+  hourlyForecasts[index].pop = pop;
 }
 
 /**
@@ -500,27 +404,23 @@ void storeDailyInfo(int index, long unixTime, String iconCode, float temperature
 void printWeatherData() {
   Serial.println("\n--- Weather Forecast Data ---");
   for (int i = 0; i < FORECAST_COUNT; i++) {
-    if (forecasts[i].label.length() > 0) {
-      Serial.print("Label: ");
-      Serial.print(forecasts[i].label);
+    if (hourlyForecasts[i].time.length() > 0) {
+      Serial.print("Time: ");
+      Serial.print(hourlyForecasts[i].time);
       Serial.print(" | IconNumber: ");
-      Serial.print(forecasts[i].iconNumber);
+      Serial.print(hourlyForecasts[i].iconNumber);
       Serial.print(" | Temperature: ");
-      Serial.print(forecasts[i].temperature);
-      Serial.print(" | POP: ");
-      Serial.print(forecasts[i].pop);
+      Serial.print(hourlyForecasts[i].temperature);
+      Serial.print("C | POP: ");
+      Serial.print(hourlyForecasts[i].pop);
       Serial.println("%");
     }
   }
 }
 
 /**
- * Fetches weather forecast data from OpenWeatherMap API or test data.
- *
- * The `exclude` parameter is adjusted per mode:
- *   - HOURLY mode excludes daily data
- *   - DAILY  mode excludes hourly data
- *
+ * Fetches weather forecast data from OpenWeatherMap API or test data
+ * 
  * @param useTestData If true, uses test data instead of API
  * @return JSON string containing weather data, or empty string on failure
  */
@@ -530,7 +430,7 @@ String fetchWeatherData(bool useTestData = TEST_MODE) {
     Serial.println("Using test data instead of API");
     return String(TEST_WEATHER_DATA);
   }
-
+  
   // Check WiFi Connection Status
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi Disconnected. Attempting to reconnect...");
@@ -541,27 +441,20 @@ String fetchWeatherData(bool useTestData = TEST_MODE) {
   }
 
   // Build OpenWeatherMap API Request URL
-  // Exclude the data array that is NOT needed for the current mode
-  const char* excludeParam = (currentMode == MODE_HOURLY)
-    ? "minutely,daily,alerts"
-    : "minutely,hourly,alerts";
-
   String url = "http://api.openweathermap.org";
   url += "/data/3.0/onecall";
   url += "?lat=" + String((float) LATITUDE, 5);
   url += "&lon=" + String((float) LONGITUDE, 5);
-  url += "&units=" + String(TEMPERATURE_UNIT == 0 ? "metric" : "imperial") + "&lang=en&exclude=" + excludeParam;
+  url += "&units=" + String(TEMPERATURE_UNIT == 0 ? "metric" : "imperial") + "&lang=en&exclude=minutely,daily,alerts";
   url += "&appid=" + (String) OPENWEATHERMAP_API_KEY;
 
-  Serial.print("Fetching weather forecast data (mode: ");
-  Serial.print(currentMode == MODE_HOURLY ? "HOURLY" : "DAILY");
-  Serial.println(") from OpenWeatherMap...");
-
+  Serial.println("Fetching weather forecast data from OpenWeatherMap...");
+  
   // Send HTTP Request and Get Response
   int retryCount = 0;
   bool exitLoop = false;
   String responseData = "";
-
+  
   const int maxRetryCount = 3;     // Maximum number of retry attempts
   while (retryCount < maxRetryCount && !exitLoop) {
     responseData = httpGETRequest(url.c_str());
@@ -612,123 +505,65 @@ String fetchWeatherData(bool useTestData = TEST_MODE) {
         break;
     }
   }
-
+  
   if (!exitLoop) {
     displayErrorMessage("Failed to fetch weather forecast data after multiple attempts");
     enterDeepSleep(false);
     return "";
   }
-
+  
   return responseData;
 }
 
 /**
- * Analyzes hourly weather data JSON and stores it in the forecast array.
- *
- * Slot 0 = current conditions.
- * Slots 1–4 = hourly[3], hourly[6], hourly[9], hourly[12]
- * (i.e. +3 h, +6 h, +9 h, +12 h from now, starting at the next round hour).
- *
- * @param jsonData JSON string containing weather data
- * @return true if analysis was successful, false otherwise
- */
-bool analyzeHourlyWeatherData(const String& jsonData) {
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, jsonData);
-
-  if (error != DeserializationError::Ok) {
-    Serial.print("JSON parsing failed! Error: ");
-    Serial.println(error.c_str());
-    String errorMsg = "JSON parsing failed! Error: " + String(error.c_str());
-    displayErrorMessage(errorMsg.c_str());
-    return false;
-  }
-
-  // Slot 0: current conditions
-  storeHourlyInfo(0,
-    doc["current"]["dt"],
-    doc["current"]["weather"][0]["icon"].as<String>(),
-    doc["current"]["temp"].as<float>(),
-    doc["current"]["pop"].as<float>());
-
-  // Determine the offset into the hourly array for the NEXT full hour.
-  // The OWC hourly array starts at the current hour, so index 1 is already
-  // the next full-hour entry.  We then step every 3 hours from there.
-  // Slots: hourly[1], hourly[4], hourly[7], hourly[10]  → +3 h steps
-  const int hourlyIndices[] = {1, 4, 7, 10};
-
-  for (int i = 0; i < 4; i++) {
-    int idx = hourlyIndices[i];
-    if (idx < (int)doc["hourly"].size()) {
-      storeHourlyInfo(i + 1,
-        doc["hourly"][idx]["dt"],
-        doc["hourly"][idx]["weather"][0]["icon"].as<String>(),
-        doc["hourly"][idx]["temp"].as<float>(),
-        doc["hourly"][idx]["pop"].as<float>());
-    } else {
-      Serial.print("Warning: hourly index ");
-      Serial.print(idx);
-      Serial.println(" is out of range");
-    }
-  }
-
-  printWeatherData();
-  Serial.println("Hourly weather data analyzed successfully");
-  return true;
-}
-
-/**
- * Analyzes daily weather data JSON and stores it in the forecast array.
- *
- * Slots 0–4 = daily[0] … daily[4]  (today + next 4 days).
- * Temperature shown is the daytime high (temp.day).
- *
- * @param jsonData JSON string containing weather data
- * @return true if analysis was successful, false otherwise
- */
-bool analyzeDailyWeatherData(const String& jsonData) {
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, jsonData);
-
-  if (error != DeserializationError::Ok) {
-    Serial.print("JSON parsing failed! Error: ");
-    Serial.println(error.c_str());
-    String errorMsg = "JSON parsing failed! Error: " + String(error.c_str());
-    displayErrorMessage(errorMsg.c_str());
-    return false;
-  }
-
-  for (int i = 0; i < FORECAST_COUNT; i++) {
-    if (i < (int)doc["daily"].size()) {
-      storeDailyInfo(i,
-        doc["daily"][i]["dt"],
-        doc["daily"][i]["weather"][0]["icon"].as<String>(),
-        doc["daily"][i]["temp"]["day"].as<float>(),
-        doc["daily"][i]["pop"].as<float>());
-    } else {
-      Serial.print("Warning: daily index ");
-      Serial.print(i);
-      Serial.println(" is out of range");
-    }
-  }
-
-  printWeatherData();
-  Serial.println("Daily weather data analyzed successfully");
-  return true;
-}
-
-/**
- * Dispatches JSON parsing to the correct analyzer for the active mode.
- *
+ * Analyzes weather data JSON and stores it in the forecast array
+ * 
  * @param jsonData JSON string containing weather data
  * @return true if analysis was successful, false otherwise
  */
 bool analyzeWeatherData(const String& jsonData) {
-  if (currentMode == MODE_HOURLY) {
-    return analyzeHourlyWeatherData(jsonData);
-  } else {
-    return analyzeDailyWeatherData(jsonData);
+  // Parse JSON Data
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, jsonData);
+
+  // Check if JSON Parsing was Successful
+  if (error != DeserializationError::Ok) {
+    Serial.print("JSON parsing failed! Error: ");
+    Serial.println(error.c_str());
+    String errorMsg = "JSON parsing failed! Error: " + String(error.c_str());
+    displayErrorMessage(errorMsg.c_str());
+    return false;
   }
+
+  // Store Current Weather Information
+  storeWeatherInfo(0, doc["current"]["dt"], 
+                  doc["current"]["weather"][0]["icon"],
+                  doc["current"]["temp"].as<float>(),
+                  doc["current"]["pop"].as<float>());
+
+  // Store Future Weather Information (3, 6, 9, 12 hours later)
+  const int hourlyIndices[] = {3, 6, 9, 12};
+  
+  for (int i = 0; i < 4; i++) {
+    int hourlyIndex = hourlyIndices[i];
+    
+    if (hourlyIndex < doc["hourly"].size()) {
+      storeWeatherInfo(i + 1, doc["hourly"][hourlyIndex]["dt"], 
+                      doc["hourly"][hourlyIndex]["weather"][0]["icon"],
+                      doc["hourly"][hourlyIndex]["temp"].as<float>(), 
+                      doc["hourly"][hourlyIndex]["pop"].as<float>());
+    } else {
+      Serial.print("Warning: Hourly index ");
+      Serial.print(hourlyIndex);
+      Serial.println(" is out of range");
+    }
+  }
+
+  // Display Retrieved Data on Serial Monitor
+  printWeatherData();
+  
+  Serial.println("Weather forecast data analyzed successfully");
+  return true;
 }
 
 /**
@@ -757,30 +592,11 @@ void fetchAndAnalyzeWeatherData() {
 
 /**
  * Function to Perform Initialization
- *
- * On every boot the wakeup cause is checked:
- *   - EXT0 (button press): toggle the display mode, then proceed normally.
- *   - Timer or first power-on:  use the current (persisted) mode.
  */
 void setup() {
   // Initialize Serial Communication
   Serial.begin(115200);
   Serial.println("Weather Forecast Display System Starting...");
-
-  // Configure the side button pin
-  pinMode(SIDE_BUTTON_PIN, INPUT_PULLUP);
-
-  // Check wakeup cause and toggle mode when the button was pressed
-  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
-  if (wakeupCause == ESP_SLEEP_WAKEUP_EXT0) {
-    // Button wakeup: flip the mode
-    currentMode = (currentMode == MODE_HOURLY) ? MODE_DAILY : MODE_HOURLY;
-    Serial.print("Button pressed – switching to mode: ");
-    Serial.println(currentMode == MODE_HOURLY ? "HOURLY" : "DAILY");
-  } else {
-    Serial.print("Timer/power-on wakeup – current mode: ");
-    Serial.println(currentMode == MODE_HOURLY ? "HOURLY" : "DAILY");
-  }
 
   // Set E-Paper Display Power Pin
   const int epdPowerPin = 7;     // GPIO pin for E-Paper power control
@@ -789,7 +605,7 @@ void setup() {
 
   // Initialize E-Paper Display GPIO
   EPD_GPIOInit();
-
+  
   // Only connect to WiFi if not in test mode
   if (!TEST_MODE) {
     // WiFi Connection
@@ -799,10 +615,10 @@ void setup() {
       return;
     }
   }
-
+  
   // Fetch and Analyze Weather forecast Data
   fetchAndAnalyzeWeatherData();
-
+  
   // Only disconnect WiFi if not in test mode
   if (!TEST_MODE) {
     // Disconnect WiFi (Power Saving)
@@ -811,8 +627,8 @@ void setup() {
 
   // Display Weather Forecast
   displayWeatherForecast();
-
-  // Enter Deep-Sleep Mode (timer aligned to next hour in HOURLY mode)
+  
+  // Enter Deep-Sleep Mode
   enterDeepSleep(true);
 }
 
