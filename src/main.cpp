@@ -139,11 +139,28 @@ ForecastInfo forecasts[FORECAST_COUNT];
  * Used in hourly mode so the display refreshes right at the hour mark.
  */
 uint64_t microsecondsUntilNextHour() {
-  time_t now = time(nullptr);
-  struct tm *t = localtime(&now);
-  int secsElapsed = t->tm_min * 60 + t->tm_sec;
+  // Use getLocalTime instead of time() — on ESP32, time() can remain 0
+  // even after SNTP has synced, while getLocalTime always reflects the
+  // SNTP-updated clock. configTime(0,0,...) gives us UTC; apply the
+  // timezone offset manually to get local min/sec.
+  struct tm utcTm;
+  if (!getLocalTime(&utcTm, 5000)) {
+    Serial.println("microsecondsUntilNextHour: clock not ready, defaulting to 60 min");
+    return 3600ULL * 1000000ULL;
+  }
+
+  // Reconstruct a time_t from the UTC struct, add offset, decompose again
+  time_t utcNow = mktime(&utcTm);
+  time_t localNow = utcNow + (time_t)(TIMEZONE_OFFSET * 3600);
+  struct tm *lt = gmtime(&localNow);
+
+  int secsElapsed = lt->tm_min * 60 + lt->tm_sec;
   int secsUntilHour = 3600 - secsElapsed;
-  if (secsUntilHour <= 0) secsUntilHour = 3600; // safety guard
+  if (secsUntilHour <= 0) secsUntilHour = 3600;
+
+  Serial.print("Local time: ");
+  Serial.print(lt->tm_hour); Serial.print(":"); Serial.println(lt->tm_min);
+  Serial.print("Seconds until next hour: "); Serial.println(secsUntilHour);
   return (uint64_t)secsUntilHour * 1000000ULL;
 }
 
@@ -172,17 +189,17 @@ void enterDeepSleep(bool wakeup) {
 
   if (wakeup) {
     uint64_t sleepUs;
-    if (currentMode == MODE_HOURLY) {
+//    if (currentMode == MODE_HOURLY) {
       sleepUs = microsecondsUntilNextHour();
       Serial.print("Hourly mode: sleeping for ");
       Serial.print((unsigned long)(sleepUs / 1000000ULL));
       Serial.println(" seconds until next hour.");
-    } else {
-      sleepUs = INTERVAL_IN_MINUTES * 60UL * 1000UL * 1000ULL;
-      Serial.print("Daily mode: sleeping for ");
-      Serial.print(INTERVAL_IN_MINUTES);
-      Serial.println(" minutes.");
-    }
+//    } else {
+//      sleepUs = INTERVAL_IN_MINUTES * 60UL * 1000UL * 1000ULL;
+//      Serial.print("Daily mode: sleeping for ");
+//      Serial.print(INTERVAL_IN_MINUTES);
+//      Serial.println(" minutes.");
+//    }
     esp_sleep_enable_timer_wakeup(sleepUs);
   }
 
@@ -242,7 +259,15 @@ void displayWeatherForecast()
       EPD_DrawCircle(100 + baseX, 201, 2, BLACK, false);
       EPD_DrawCircle(100 + baseX, 201, 3, BLACK, false);
 
-      if (i != -1) {
+      if (i == 0) {
+        // First column: draw a small mode indicator where the pop line would be
+        char micro[64];
+        snprintf(micro, sizeof(micro), "%u", microsecondsUntilNextHour()/1000000);
+
+        EPD_ShowString(30 + baseX, 225,
+          micro, //currentMode == MODE_HOURLY ? "HOURLY" : "DAILY",
+          24, BLACK);
+      } else {
         // Display Probability of precipitation
         memset(buffer, 0, sizeof(buffer));
         snprintf(buffer, sizeof(buffer), "%3d %%", (int)round(100 * forecasts[i].pop));
@@ -349,6 +374,29 @@ bool connectToWiFi() {
     Serial.println("");
     Serial.print("Connected to WiFi with IP Address: ");
     Serial.println(WiFi.localIP());
+
+    // Synchronize system clock via NTP.
+    // Use UTC (offset=0) so time() returns a clean Unix timestamp.
+    // Timezone offset is applied manually wherever local time is needed.
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.print("Waiting for NTP sync");
+    struct tm ntpTime;
+    bool synced = false;
+    for (int i = 0; i < 40; i++) {   // up to 20 seconds
+      delay(500);
+      Serial.print(".");
+      if (getLocalTime(&ntpTime, 0) && ntpTime.tm_year > 100) {
+        synced = true;
+        break;
+      }
+    }
+    Serial.println(synced ? " synced." : " timed out!");
+    if (synced) {
+      Serial.print("UTC time: ");
+      Serial.print(ntpTime.tm_hour); Serial.print(":");
+      Serial.println(ntpTime.tm_min);
+    }
+
     return true;
   } else {
     Serial.println("");
@@ -453,8 +501,8 @@ void storeHourlyInfo(int index, long unixTime, String iconCode, float temperatur
   }
 
   // Convert UTC Unix Timestamp to Local Time
-  time_t localTime = unixTime + TIMEZONE_OFFSET * 3600;
-  struct tm *timeinfo = localtime(&localTime);
+  time_t localTime = unixTime + (time_t)(TIMEZONE_OFFSET * 3600);
+  struct tm *timeinfo = gmtime(&localTime);  // gmtime on pre-offset value
 
   char tempLabel[6];
   strftime(tempLabel, sizeof(tempLabel), "%k:%M", timeinfo);
@@ -483,8 +531,8 @@ void storeDailyInfo(int index, long unixTime, String iconCode, float temperature
   }
 
   // Convert UTC Unix Timestamp to Local Time
-  time_t localTime = unixTime + TIMEZONE_OFFSET * 3600;
-  struct tm *timeinfo = localtime(&localTime);
+  time_t localTime = unixTime + (time_t)(TIMEZONE_OFFSET * 3600);
+  struct tm *timeinfo = gmtime(&localTime);  // gmtime on pre-offset value
 
   char tempLabel[5]; // "Mon\0"
   strftime(tempLabel, sizeof(tempLabel), " %a", timeinfo);
@@ -790,24 +838,20 @@ void setup() {
   // Initialize E-Paper Display GPIO
   EPD_GPIOInit();
 
-  // Only connect to WiFi if not in test mode
-  if (!TEST_MODE) {
-    // WiFi Connection
-    if (!connectToWiFi()) {
-      displayErrorMessage("WiFi Connection Error");
-      enterDeepSleep(false);
-      return;
-    }
+  // Connect to WiFi and synchronize the system clock via NTP.
+  // This must happen even in TEST_MODE so that microsecondsUntilNextHour()
+  // has a valid clock to work with.
+  if (!connectToWiFi()) {
+    displayErrorMessage("WiFi Connection Error");
+    enterDeepSleep(false);
+    return;
   }
 
-  // Fetch and Analyze Weather forecast Data
+  // Fetch and Analyze Weather forecast Data (uses test JSON when TEST_MODE=true)
   fetchAndAnalyzeWeatherData();
 
-  // Only disconnect WiFi if not in test mode
-  if (!TEST_MODE) {
-    // Disconnect WiFi (Power Saving)
-    disconnectWiFi();
-  }
+  // Disconnect WiFi to save power
+  disconnectWiFi();
 
   // Display Weather Forecast
   displayWeatherForecast();
